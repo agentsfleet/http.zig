@@ -501,6 +501,13 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
         pub fn deinit(self: *Self) void {
             const allocator = self.allocator;
 
+            // Vendor patch (see CHANGES.md): stop()/join the pool threads BEFORE
+            // freeing the websocket and the pool arena. A queued processData task
+            // dereferences self.websocket; without this, the normal deinit path
+            // frees it (and the arena) out from under a live pool thread —
+            // intermittent SIGSEGV at Linux NonBlocking shutdown teardown.
+            self.thread_pool.stop();
+
             self.websocket.deinit();
             allocator.destroy(self.websocket);
 
