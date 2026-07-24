@@ -501,11 +501,13 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
         pub fn deinit(self: *Self) void {
             const allocator = self.allocator;
 
-            // Vendor patch (see CHANGES.md): stop()/join the pool threads BEFORE
-            // freeing the websocket and the pool arena. A queued processData task
-            // dereferences self.websocket; without this, the normal deinit path
-            // frees it (and the arena) out from under a live pool thread —
-            // intermittent SIGSEGV at Linux NonBlocking shutdown teardown.
+            // Join in-flight handlers before freeing ANY connection state they
+            // may still be reading. run() only stops the event loop, so a handler
+            // can still be mid-callback here. This must come before
+            // websocket.deinit(), which frees the per-connection read buffers via
+            // buffer_provider.deinit(): a handler still in dataAvailable() can be
+            // reading a parsed message that holds zero-copy slices into those
+            // buffers, so joining afterward would be too late -> use-after-free.
             self.thread_pool.stop();
 
             self.websocket.deinit();
@@ -575,6 +577,16 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 now = timestamp(io);
                 var closed_conn = false;
 
+                // Defer signal handling (which disowns/frees handed-over
+                // connections) until the whole event batch is drained. epoll can
+                // return a .signal and a .recv for the same connection in one
+                // batch; processing the signal first would free the connection,
+                // and the later .recv would then dereference freed memory in
+                // getState(). By deferring, every .recv runs while its connection
+                // is still alive, sees the .handover state set before the signal,
+                // and skips it; the free happens safely afterward.
+                var has_signal = false;
+
                 while (it.next()) |event| {
                     switch (event) {
                         .accept => self.accept(listener, now) catch |err| {
@@ -583,7 +595,7 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                                 log.err("Failed to do a mini recovery sleep: {}", .{err2});
                             };
                         },
-                        .signal => self.processSignal(&closed_conn),
+                        .signal => has_signal = true,
                         .recv => |conn| switch (conn.protocol) {
                             .http => |http_conn| {
                                 switch (http_conn.getState()) {
@@ -637,6 +649,10 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                         .shutdown => return,
                     }
                 }
+
+                // Now that every .recv in this batch has been handled, it is safe
+                // to disown/free the connections handed over since the last batch.
+                if (has_signal) self.processSignal(&closed_conn);
 
                 const batch_size = thread_pool.batch_size;
                 if (batch_size > 0) {
@@ -770,7 +786,13 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                 switch (http_conn.handover) {
                     .close, .unknown => {
                         closed_bool.* = true;
-                        // http handler already closed the socket
+                        // Remove from the event loop and close here, on the loop
+                        // thread, before disown() recycles the Conn. The fd is
+                        // still open (processHTTPData no longer closes it on the
+                        // worker thread), so the DEL is valid and no later batch
+                        // can deliver a .recv for the freed Conn.
+                        loop.remove(conn);
+                        conn.close();
                         self.disown(conn);
                     },
                     .disown => {
@@ -841,15 +863,15 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
                     return;
                 },
                 .close, .unknown => {
-                    // We _have_ to close the connection here in order to avoid
-                    // a bad race condition. By closing it here, we [automatically]
-                    // remove the connection from epoll/kqueue, which ensures that
-                    // in a single loop through ready-event we won't process both
-                    // a signal and a recv message.
-                    // If we don't do this here, then you'd get a segfault if
-                    // the signal cleared the connetion, and then in recv we'd
-                    // try to call conn.getState() after the signal.
-                    posix.close(http_conn.stream.socket.handle);
+                    // Closing the socket (which removes it from epoll/kqueue) is
+                    // deferred to processSignal on the event-loop thread. Closing
+                    // here, on a worker thread, raced epoll_wait: the fd could
+                    // stay armed past the point where disown() recycled the Conn,
+                    // so a later batch delivered a .recv carrying a pointer to
+                    // freed memory (getState on a null/recycled HTTPConn). The
+                    // signal-vs-recv-in-one-batch case this used to guard against
+                    // is now handled by deferring signal processing to the end of
+                    // the event batch plus the getState() .handover check in recv.
                 },
                 .websocket, .disown => {},
             }
@@ -858,16 +880,25 @@ pub fn NonBlocking(comptime S: type, comptime WSH: type) type {
         }
 
         pub fn processWebsocketData(self: *Self, conn: *Conn(WSH), thread_buf: []u8, hc: *ws.HandlerConn(WSH)) void {
-            defer conn.releaseProcessing();
-
             var ws_conn = &hc.conn;
             const success = self.websocket.worker.dataAvailable(hc, thread_buf);
             if (success == false) {
                 ws_conn.close(.{ .code = 4997, .reason = "wsz" }) catch {};
                 self.websocket.cleanupConn(hc);
+                conn.releaseProcessing();
             } else if (ws_conn.isClosed()) {
                 self.websocket.cleanupConn(hc);
+                conn.releaseProcessing();
             } else {
+                // Release `processing` before re-arming. With EPOLLONESHOT, re-arming
+                // while still holding `processing` loses a read that arrives in the
+                // window between the re-arm and the release: the event loop sees the
+                // connection as busy (acquireProcessing fails) and the one-shot arming
+                // is consumed, so the read is dropped and the connection hangs / leaks
+                // (CLOSE_WAIT). Releasing first means a read arriving after this
+                // dispatches a fresh worker, and a read already buffered is re-reported
+                // when rearmRead arms the readable fd.
+                conn.releaseProcessing();
                 self.loop.rearmRead(conn) catch |err| {
                     log.debug("({f}) failed to add read event monitor: {}", .{ ws_conn.address, err });
                     ws_conn.close(.{ .code = 4998, .reason = "wsz" }) catch {};
@@ -1113,6 +1144,17 @@ fn KQueue(comptime WSH: type) type {
             try self.change(conn.getSocket(), @intFromPtr(conn), posix.system.EVFILT.READ, posix.system.EV.ADD | posix.system.EV.ENABLE, 0);
         }
 
+        fn remove(self: *Self, conn: *Conn(WSH)) void {
+            _ = posix.kevent(self.fd, &.{.{
+                .ident = @intCast(conn.getSocket()),
+                .filter = posix.system.EVFILT.READ,
+                .flags = posix.system.EV.DELETE,
+                .fflags = 0,
+                .data = 0,
+                .udata = 0,
+            }}, &.{}, null) catch {};
+        }
+
         fn rearmRead(self: *Self, conn: *Conn(WSH)) !void {
             // called from the worker thread, can't use change_buffer
             // must remove then re-add for macOS
@@ -1280,6 +1322,10 @@ fn EPoll(comptime WSH: type) type {
                 .events = linux.EPOLL.IN | linux.EPOLL.RDHUP,
             };
             return posix.epoll_ctl(self.fd, linux.EPOLL.CTL_ADD, conn.getSocket(), &event);
+        }
+
+        fn remove(self: *Self, conn: *Conn(WSH)) void {
+            posix.epoll_ctl(self.fd, linux.EPOLL.CTL_DEL, conn.getSocket(), null) catch {};
         }
 
         fn rearmRead(self: *Self, conn: *Conn(WSH)) !void {

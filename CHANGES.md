@@ -1,42 +1,14 @@
 # Vendor patches over upstream httpz
 
 Source: https://github.com/karlseguin/http.zig (branch `master`)
-Pinned upstream commit: `f39f1ed803fcf080a01a3ab9c11b3cf9e0ff9aa8`
+Pinned upstream commit: `52eb187cff75e168316b44480cd9f0fae26a1c5e`
 
-This directory is a verbatim copy of upstream at the commit above plus the single
-local patch below. Master already carries the full Zig 0.16 migration (Io-threaded,
-`std.Io.Writer`, tagged-union `Address`) — verified clean build + 123/123 tests on
-0.16.0-final — so no 0.16 API patches are needed here. Drop the vendor copy and
-re-pin to upstream once the patch below lands there.
+This directory is a copy of upstream at the commit above plus the two local
+patches below. Upstream now includes the non-blocking shutdown fix that this fork
+previously carried. Drop this fork and re-pin to upstream once the shared-queue
+and worker-mode patches land there.
 
-## Patch 1 — Worker.deinit must stop the thread pool before freeing websocket + arena
-
-**File:** `src/worker.zig`, non-blocking `Worker(WSH).deinit`
-
-**Symptom upstream:** Intermittent SIGSEGV during shutdown teardown on Linux
-(non-blocking event loop). `thread_pool.deinit()` only frees the per-worker arena;
-it does NOT call `thread_pool.stop()`, which sets the `stopped` flag, broadcasts
-`read_cond`, and joins the pool threads. So after the listen thread joins, pool
-worker threads are still live — blocked on `read_cond.wait` or mid-`processData`
-— and the normal deinit path frees the websocket (`worker.zig:504-505`) and the
-pool arena out from under them. A queued `processData` task dereferences
-`self.websocket` → use-after-free.
-
-The Blocking worker variant is unaffected: its `listen()` already calls
-`thread_pool.stop()` during shutdown. Linux CI uses non-blocking; macOS uses
-Blocking, which is why this only repros on Linux.
-
-**Fix:** Call `self.thread_pool.stop()` as the FIRST statement of non-blocking
-`Worker.deinit` — before `self.websocket.deinit()`. Placement is load-bearing:
-master keeps the websocket live and a pool task dereferences it, so the pool must
-be joined before the websocket is freed. (The prior vendored base at `40be022`
-disabled websocket, so stopping later was safe; master does not, so `stop()` moves
-to the top of `deinit`.)
-
-**Upstream PR:** TBD — to be opened against karlseguin/http.zig with this patch and
-a stop-during-shutdown regression test.
-
-## Patch 2 — ThreadPool: shared injector queue replaces per-thread private queues
+## Patch 1 — ThreadPool: shared injector queue replaces per-thread private queues
 
 **File:** `src/thread_pool.zig`
 
@@ -83,3 +55,15 @@ before it`, `stop is idempotent`, `pending counts across ring wraparound`, and
 
 **Upstream PR:** TBD — Indy's call on filing (this rewrite vs a minimal
 work-stealing fix are different upstream conversations).
+
+## Patch 2 — Keep the websocket dependency in the selected worker mode
+
+**File:** `build.zig`
+
+**Symptom upstream:** `zig build test -Dforce_blocking=true` fails because
+`httpz` selects its blocking worker while `websocket.zig` remains in its default
+non-blocking mode. The resulting websocket worker has no `readLoop` method.
+
+**Fix:** Pass the existing `force_blocking` option to `websocket.zig` as
+`websocket_blocking`. This keeps both libraries in the same mode and restores the
+blocking test suite without changing the default non-blocking build.

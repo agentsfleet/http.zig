@@ -9,6 +9,7 @@ pub fn build(b: *std.Build) !void {
     const websocket_module = b.dependency("websocket", dep_opts).module("websocket");
 
     const enable_tsan = b.option(bool, "tsan", "Enable ThreadSanitizer");
+    const force_blocking = b.option(bool, "force_blocking", "Force blocking mode") orelse false;
 
     const httpz_module = b.addModule("httpz", .{
         .link_libc = true,
@@ -23,8 +24,13 @@ pub fn build(b: *std.Build) !void {
     });
     {
         const options = b.addOptions();
-        options.addOption(bool, "httpz_blocking", false);
+        options.addOption(bool, "httpz_blocking", force_blocking);
         httpz_module.addOptions("build", options);
+    }
+    {
+        const options = b.addOptions();
+        options.addOption(bool, "websocket_blocking", force_blocking);
+        websocket_module.addOptions("build", options);
     }
 
     {
@@ -34,17 +40,6 @@ pub fn build(b: *std.Build) !void {
             .filters = test_filter orelse &.{},
             .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
         });
-        const force_blocking = b.option(bool, "force_blocking", "Force blocking mode") orelse false;
-        {
-            const options = b.addOptions();
-            options.addOption(bool, "httpz_blocking", force_blocking);
-            tests.root_module.addOptions("build", options);
-        }
-        {
-            // const options = b.addOptions();
-            // options.addOption(bool, "websocket_blocking", force_blocking);
-            // websocket_module.addOptions("build", options);
-        }
 
         tests.root_module.addImport("metrics", metrics_module);
         // tests.root_module.addImport("websocket", websocket_module);
