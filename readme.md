@@ -1,3 +1,11 @@
+> [!CAUTION]
+> **This fork is sunset and archived.**
+> [`agentsfleet`](https://github.com/agentsfleet/agentsfleet) has moved to Rust,
+> so this Zig dependency fork is no longer used or maintained. See
+> [github.com/agentsfleet/agentsfleet](https://github.com/agentsfleet/agentsfleet)
+> for current work, or [karlseguin/http.zig](https://github.com/karlseguin/http.zig)
+> for the upstream project.
+
 # An HTTP/1.1 server for Zig.
 
 ## Zig Version
